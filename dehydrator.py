@@ -52,6 +52,46 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 _PROMPT_VERSION = 4
 
 
+# DEHYDRATE_PROMPT 要求模型输出纯 JSON,但结果一直被原样拼进上下文
+# (含 ``` 围栏和缩进),浮现一次要多烧几千 token 且难读。这里把它渲染成
+# 紧凑文本。认不出来的内容(短记忆直通/旧缓存/模型跑偏)一律原样返回。
+_DEHYDRATED_KEYS = ("summary", "core_facts", "emotion_state", "todos", "keywords")
+
+
+def _render_dehydrated(content: str) -> str:
+    """脱水 JSON → 可读文本;不是脱水 JSON 就原样返回。"""
+    if not content or "{" not in content:
+        return content
+    try:
+        data = json.loads(clean_llm_json(content))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return content
+    if not isinstance(data, dict) or not any(k in data for k in _DEHYDRATED_KEYS):
+        return content
+
+    def _clean_list(value):
+        if not isinstance(value, list):
+            return []
+        # 先滤掉 None,否则 str(None) 会渲染出字面的 "None"
+        return [s for s in (str(v).strip() for v in value if v is not None) if s]
+
+    lines = []
+    summary = str(data.get("summary") or "").strip()
+    if summary:
+        lines.append(summary)
+    lines.extend(f"· {f}" for f in _clean_list(data.get("core_facts")))
+    emotion = str(data.get("emotion_state") or "").strip()
+    if emotion:
+        lines.append(f"情绪:{emotion}")
+    todos = _clean_list(data.get("todos"))
+    if todos:
+        lines.append("待办:" + "；".join(todos))
+    keywords = _clean_list(data.get("keywords"))
+    if keywords:
+        lines.append("关键词:" + "、".join(keywords))
+    return "\n".join(lines) if lines else content
+
+
 def _perspective_rule() -> str:
     """Keep actor ownership stable in every rewriting prompt."""
     human = os.environ.get("HUMAN_NAME", "用户").strip() or "用户"
@@ -707,6 +747,7 @@ class Dehydrator:
                 header += " [已内化]"
             header += "\n"
 
+        content = _render_dehydrated(content)
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
         return f"{header}{content}"
 

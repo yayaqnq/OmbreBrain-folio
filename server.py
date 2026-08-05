@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 
 from bucket_manager import BucketManager
+import snapshot_store
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
@@ -1471,8 +1472,9 @@ async def trace(
     media_replace=None,
     hard_delete: bool = False,
     delete_reason: str = "",
+    parent_id: str = "",
 ) -> str:
-    """修改记忆元数据或内容。resolved=1归档(移入归档区→不再浮现、也不再被检索;可在 dashboard 归档区查看/恢复)/0取消归档标记,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
+    """修改记忆元数据或内容。parent_id=把这条挂到另一条记忆下面(记忆树,表示"这条是从那条来的";传 "-" 表示从树上摘下来变回独立)。resolved=1归档(移入归档区→不再浮现、也不再被检索;可在 dashboard 归档区查看/恢复)/0取消归档标记,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1552,6 +1554,16 @@ async def trace(
     # 空字符串语义=清掉该字段,非空但非法的会被规范化函数返回 None 然后清掉
     if event_time != "":
         updates["event_time"] = event_time
+    # 记忆树:默认空字符串=不动(跟其它字段一致),"-" 才是"摘下来"。
+    # 允许直接写来源记忆的名字,不必记 ID。
+    if parent_id:
+        if parent_id.strip() == "-":
+            updates["parent_id"] = ""
+        else:
+            _pnode, _perr = await _resolve_bucket(parent_id)
+            if _perr:
+                return f"挂不上去 — {_perr}"
+            updates["parent_id"] = _pnode["id"]
     if content:
         updates["content"] = content
     if media_append:
@@ -1709,6 +1721,145 @@ async def release(bucket_id: str) -> str:
     if result.get("noop"):
         return f"它本来就不是 anchor。当前 {result['count']}/{result['limit']}。"
     return f"已解除 anchor。当前 {result['count']}/{result['limit']}。"
+
+
+async def _resolve_bucket(ref: str):
+    """把用户给的"记忆ID 或 名字"解析成一个桶。
+
+    返回 (bucket, 错误提示)。成功时 err 为 None;失败时 bucket 为 None。
+    先当 ID 试,不中再按名字找(精确优先,唯一模糊命中也认)——
+    人不会记 292c18e8a2d9 这种,得让名字能用。
+    """
+    q = str(ref or "").strip()
+    if not q:
+        return None, "请给记忆的名字或 ID。"
+    hit = await bucket_mgr.get(q)
+    if hit:
+        return hit, None
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    exact = [b for b in buckets if (b.get("metadata") or {}).get("name", "") == q]
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        ids = "、".join(f"{(b['metadata'] or {}).get('name', '?')}[{b['id']}]" for b in exact[:8])
+        return None, f"有 {len(exact)} 条都叫「{q}」,用 ID 指定:{ids}"
+    fuzzy = [b for b in buckets if q in (b.get("metadata") or {}).get("name", "")]
+    if len(fuzzy) == 1:
+        return fuzzy[0], None
+    if len(fuzzy) > 1:
+        ids = "、".join(f"{(b['metadata'] or {}).get('name', '?')}[{b['id']}]" for b in fuzzy[:8])
+        return None, f"「{q}」命中 {len(fuzzy)} 条,说具体点或用 ID:{ids}"
+    return None, f"没找到叫「{q}」的记忆(也不是有效的 ID)。"
+
+
+@mcp.tool()
+async def tree(bucket_id: str = "", depth: int = 3) -> str:
+    """看记忆之间的来龙去脉(记忆树)。
+
+    传 bucket_id：显示这条记忆的上游(它是从哪来的)和下游(从它长出了什么)。
+    不传：列出所有"线头"——那些自己没有来源、但底下挂着东西的记忆。
+    用 trace(bucket_id, parent_id="另一条的ID") 来挂关系。
+    """
+    bid = str(bucket_id or "").strip()
+    try:
+        depth = max(1, min(6, int(depth)))
+    except (TypeError, ValueError):
+        depth = 3
+
+    if not bid:
+        roots = await bucket_mgr.roots()
+        if not roots:
+            return ('还没有任何记忆被串起来。\n'
+                    '用 trace("记忆ID", parent_id="来源记忆ID") 挂第一条。')
+        lines = [f"共 {len(roots)} 条线："]
+        for r in roots:
+            meta = r.get("metadata") or {}
+            kids = await bucket_mgr.children(r["id"])
+            lines.append(f"  ● {meta.get('name') or r['id']}  [{r['id']}]  下挂 {len(kids)} 条")
+        lines.append('\n看某一条：tree("记忆ID")')
+        return "\n".join(lines)
+
+    node, err = await _resolve_bucket(bid)
+    if err:
+        return err
+    bid = node["id"]
+
+    out = []
+    ups = await bucket_mgr.ancestors(bid)
+    if ups:
+        out.append("往上追溯：")
+        for i, a in enumerate(reversed(ups)):
+            am = a.get("metadata") or {}
+            out.append("  " + "  " * i + f"└ {am.get('name') or a['id']}  [{a['id']}]")
+        indent = "  " + "  " * len(ups)
+    else:
+        out.append("这条是起点(上面没有来源)。")
+        indent = "  "
+
+    meta = node.get("metadata") or {}
+    out.append(f"{indent}◆ {meta.get('name') or bid}  [{bid}]  ← 当前")
+
+    sub = await bucket_mgr.subtree(bid, depth=depth)
+
+    def render(item, level):
+        for child in item.get("children", []):
+            out.append(f"{indent}{'  ' * (level + 1)}└ {child['name']}  [{child['id']}]"
+                       + (f"  {child['preview']}" if child.get("preview") else ""))
+            render(child, level + 1)
+
+    if sub.get("children"):
+        out.append("往下展开：")
+        render(sub, 0)
+    else:
+        out.append("(下面还没有挂东西)")
+    return "\n".join(out)
+
+
+@mcp.tool()
+async def rewind(bucket_id: str, to: str = "") -> str:
+    """看某条记忆的历史版本，或把它退回之前某一版（改错了能撤回）。
+
+    to 留空 = 只列出有哪些版本；
+    to="previous" 或 "1" = 退回上一版；"2" = 再往前一版，以此类推；
+    to 也可以直接填列表里显示的版本号(时间戳)。
+    退回只还原内容/标题/标签等，不动置顶与存放位置；退回动作本身也会存一版，可以再撤回。
+    """
+    node, err = await _resolve_bucket(bucket_id)
+    if err:
+        return err
+    bid = node["id"]
+    label = (node.get("metadata") or {}).get("name") or bid
+    snaps = await bucket_mgr.list_snapshots(bid)
+    if not snaps:
+        return f"「{label}」还没有历史版本（只有实质性修改才会存版本）。"
+
+    choice = str(to or "").strip()
+    if not choice:
+        lines = [f"「{label}」共 {len(snaps)} 个历史版本（最新在前）："]
+        for i, s in enumerate(snaps, 1):
+            preview = s.get("preview") or "(空)"
+            lines.append(f"  {i}. [{s['ts']}] {s['timestamp'][:16]}  {preview}")
+        lines.append('回退：rewind("%s", to="1") 退到上一版。' % bid)
+        return "\n".join(lines)
+
+    if choice == "previous":
+        choice = "1"
+    target = None
+    if choice.isdigit():
+        n = int(choice)
+        # 小数字当序号,大数字当时间戳
+        if 1 <= n <= len(snaps):
+            target = snaps[n - 1]
+        else:
+            target = next((s for s in snaps if s["ts"] == n), None)
+    if not target:
+        return f"找不到版本 {choice}。先用 rewind(\"{bid}\") 看看有哪些。"
+
+    ok = await bucket_mgr.restore_snapshot(bid, target["ts"])
+    if not ok:
+        return f"回退失败（版本 {target['ts']}）。"
+    return (f"已把「{label}」退回 {target['timestamp'][:16]} 那一版。"
+            f"回退前的样子也存下来了，后悔可以再 rewind 回来。")
 
 
 @mcp.tool()
@@ -3404,6 +3555,7 @@ async def api_bucket_update(request):
         "media_replace", "why_remembered", "meaning", "meaning_append",
         "status", "weight", "dont_surface", "first_of_kind",
         "triggered_by", "related_bucket", "author", "user_name", "title", "letter_date", "aspect",
+        "parent_id",  # 记忆树:挂到哪条记忆下面(传空 = 摘下来变独立)
     }
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
@@ -3956,6 +4108,97 @@ async def api_bucket_restore(request):
         "id": bucket_id,
         "restored": True,
         "embedding_queued": embedding_queued,
+    })
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/tree", methods=["GET"])
+async def api_bucket_tree(request):
+    """记忆树:某条记忆的上游(ancestors)与下游(subtree)。"""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        depth = max(1, min(6, int(request.query_params.get("depth", 3))))
+    except (TypeError, ValueError):
+        depth = 3
+    if not await bucket_mgr.get(bucket_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ups = await bucket_mgr.ancestors(bucket_id)
+    return JSONResponse({
+        "id": bucket_id,
+        "ancestors": [{"id": a["id"],
+                       "name": (a.get("metadata") or {}).get("name") or a["id"]}
+                      for a in ups],
+        "subtree": await bucket_mgr.subtree(bucket_id, depth=depth),
+    })
+
+
+@mcp.custom_route("/api/tree/roots", methods=["GET"])
+async def api_tree_roots(request):
+    """所有"线头":自己没来源、但底下挂了东西的记忆。"""
+    from starlette.responses import JSONResponse
+    roots = await bucket_mgr.roots()
+    out = []
+    for r in roots:
+        kids = await bucket_mgr.children(r["id"])
+        out.append({"id": r["id"],
+                    "name": (r.get("metadata") or {}).get("name") or r["id"],
+                    "children_count": len(kids)})
+    return JSONResponse({"count": len(out), "roots": out})
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/snapshots", methods=["GET"])
+async def api_bucket_snapshots(request):
+    """列出某条记忆的历史版本(最新在前)。"""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    snaps = await bucket_mgr.list_snapshots(bucket_id)
+    return JSONResponse({
+        "id": bucket_id,
+        "count": len(snaps),
+        # path 是服务器本地路径,不外泄
+        "snapshots": [{k: v for k, v in s.items() if k != "path"} for s in snaps],
+    })
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/snapshots/{ts}", methods=["GET"])
+async def api_bucket_snapshot_detail(request):
+    """读某一版历史的完整内容(预览用,不改任何东西)。"""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        ts = int(request.path_params["ts"])
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "bad timestamp"}, status_code=400)
+    snap = snapshot_store.read_snapshot(bucket_mgr.base_dir, bucket_id, ts)
+    if not snap:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(snap)
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/snapshots/{ts}/restore", methods=["POST"])
+async def api_bucket_snapshot_restore(request):
+    """把记忆退回某一版。需要 body 里带 {"confirm":"RESTORE"} 防误触。"""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        ts = int(request.path_params["ts"])
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "bad timestamp"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if (body or {}).get("confirm") != "RESTORE":
+        return JSONResponse({"error": 'need {"confirm":"RESTORE"}'}, status_code=400)
+    if not await bucket_mgr.get(bucket_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ok = await bucket_mgr.restore_snapshot(bucket_id, ts)
+    if not ok:
+        return JSONResponse({"error": "restore failed"}, status_code=400)
+    _invalidate_buckets_cache()
+    return JSONResponse({
+        "ok": True, "id": bucket_id, "restored_to": ts,
+        "embedding_queued": embedding_outbox.is_pending(bucket_id),
     })
 
 

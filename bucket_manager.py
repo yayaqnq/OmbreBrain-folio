@@ -46,6 +46,7 @@ import jieba
 from rapidfuzz import fuzz
 
 from media_store import MediaStore
+import snapshot_store
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, is_highlighted, is_protected, is_internalized
 from utils import atomic_write_text as _atomic_write_text
 from utils import sideline_stale_dest as _sideline_stale_dest
@@ -823,6 +824,7 @@ class BucketManager:
         triggered_by: str = "",
         dont_surface: bool = False,
         test_data: bool = False,
+        parent_id: str = "",
     ) -> str:
         pinned_like = bool(pinned or protected or highlight)
         projected = {
@@ -854,7 +856,7 @@ class BucketManager:
                 event_time=event_time, created_by=created_by, summary=summary, media=media,
                 why_remembered=why_remembered, meaning=meaning, source_tool=source_tool,
                 grow_batch_id=grow_batch_id, weight=weight, triggered_by=triggered_by,
-                dont_surface=dont_surface, test_data=test_data,
+                dont_surface=dont_surface, test_data=test_data, parent_id=parent_id,
             )
 
     async def _create_unlocked(
@@ -882,6 +884,7 @@ class BucketManager:
         triggered_by: str = "",
         dont_surface: bool = False,
         test_data: bool = False,
+        parent_id: str = "",
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -957,6 +960,11 @@ class BucketManager:
             metadata["weight"] = max(0.0, min(1.0, parsed_weight))
         if triggered_by:
             metadata["triggered_by"] = str(triggered_by).strip()[:128]
+        # 记忆树:挂在哪条记忆下面。只认真实存在的桶,认不出就当没传(不报错,
+        # 免得建记忆这种高频动作因为一个可选字段失败)。新建时不可能成环。
+        _pid = str(parent_id or "").strip()
+        if _pid and _pid != bucket_id and self._find_bucket_file(_pid):
+            metadata["parent_id"] = _pid
         if dont_surface:
             metadata["dont_surface"] = True
         if test_data:
@@ -1181,6 +1189,29 @@ class BucketManager:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
 
+        # --- 改动前留一份原样, 供 rewind 撤回 ---
+        # 只在实质性字段被改时留(每次 update 都会刷 last_active, 不过滤会存爆),
+        # 且必须在任何 mutation 之前抓 —— 下面的 lazy migrate 就已经在改 post 了。
+        _pre_snapshot = None
+        try:
+            if snapshot_store.is_substantive(kwargs):
+                _pre_snapshot = (dict(post.metadata), post.content)
+        except Exception:
+            _pre_snapshot = None
+
+        # --- parent_id 先校验再动 post ---
+        # 放在所有 mutation 之前:一旦这里抛错,整次 update 应当原样中止,
+        # 不能出现"改了一半、parent_id 又非法"的半吊子状态。
+        if "parent_id" in kwargs:
+            _new_parent = str(kwargs["parent_id"] or "").strip()
+            if _new_parent:
+                if _new_parent == bucket_id:
+                    raise ValueError("parent_id 不能是自己。")
+                if not self._find_bucket_file(_new_parent):
+                    raise ValueError(f"parent_id 指向的记忆不存在:{_new_parent}")
+                if self._would_cycle(bucket_id, _new_parent):
+                    raise ValueError("这样挂会让记忆链绕成环(或层级过深),已阻止。")
+
         # --- Lazy migrate: 老 pinned=True 数据 → protected + highlight ---
         # --- 任何 update 调用都顺手把老字段清掉,逐渐让数据集走向干净 ---
         if "pinned" in post and "protected" not in post:
@@ -1276,6 +1307,13 @@ class BucketManager:
             if post.get("type") != "plan":
                 raise ValueError("weight 只能用于 plan 桶。")
             post["weight"] = value
+        # 记忆树:合法性已在函数开头校验过,这里只负责写/清
+        if "parent_id" in kwargs:
+            _pv = str(kwargs["parent_id"] or "").strip()
+            if _pv:
+                post["parent_id"] = _pv
+            else:
+                _drop("parent_id")      # 传空 = 从树上摘下来,变回独立记忆
         for text_key, limit in (
             ("triggered_by", 128),
             ("related_bucket", 128),
@@ -1472,6 +1510,16 @@ class BucketManager:
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
 
+        # 落盘前把"改动前的样子"存下来。整段 try/except 吞掉 ——
+        # 下面一行是记忆文件唯一的写入点, 快照出任何问题都不能连累它。
+        if _pre_snapshot is not None:
+            try:
+                snapshot_store.write_snapshot(
+                    self.base_dir, bucket_id, _pre_snapshot[0], _pre_snapshot[1]
+                )
+            except Exception:
+                pass
+
         try:
             _atomic_write_text(file_path, frontmatter.dumps(post))
         except OSError as e:
@@ -1541,6 +1589,14 @@ class BucketManager:
 
         try:
             post = frontmatter.load(file_path)
+            # 进回收站前留一版 —— 软删本身可 restore, 但 restore 恢复的是
+            # "删除那一刻"的样子, 这份快照让内容也能往前翻。
+            try:
+                snapshot_store.write_snapshot(
+                    self.base_dir, bucket_id, dict(post.metadata), post.content
+                )
+            except Exception:
+                pass
             domain = post.get("domain") or ["未分类"]
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
             trash_subdir = os.path.join(self.trash_dir, primary_domain)
@@ -1624,6 +1680,175 @@ class BucketManager:
         self._queue_embedding(bucket_id, post.content)
         logger.info(f"Restored bucket / 从回收站恢复: {bucket_id} → {original_type}/{primary_domain}/")
         return True
+
+    # ---------------------------------------------------------
+    # Rewind: 把某条记忆回退到之前存下的某一版
+    # (跟上面的 restore 不是一回事 —— restore 是"从回收站捞回来",
+    #  rewind 是"内容改错了, 退回上一版")
+    # ---------------------------------------------------------
+    async def list_snapshots(self, bucket_id: str) -> list[dict]:
+        return snapshot_store.list_snapshots(self.base_dir, bucket_id)
+
+    async def restore_snapshot(self, bucket_id: str, ts: int) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._restore_snapshot_locked(bucket_id, int(ts))
+
+    async def _restore_snapshot_locked(self, bucket_id: str, ts: int) -> bool:
+        snap = snapshot_store.read_snapshot(self.base_dir, bucket_id, ts)
+        if not snap:
+            logger.warning(f"rewind: 找不到快照 {bucket_id}@{ts}")
+            return False
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            logger.warning(f"rewind: 找不到桶 {bucket_id}")
+            return False
+
+        try:
+            post = frontmatter.load(file_path)
+        except Exception as e:
+            logger.warning(f"rewind: 加载桶失败 {bucket_id}: {e}")
+            return False
+
+        # 回退本身也可撤回 —— 先把"回退前"存一版
+        try:
+            snapshot_store.write_snapshot(
+                self.base_dir, bucket_id, dict(post.metadata), post.content
+            )
+        except Exception:
+            pass
+
+        old_meta = snap.get("metadata") or {}
+
+        # 只回退"内容类"字段。type / protected / highlight 受配额管制
+        # (置顶数量上限)且决定文件存哪个目录 —— 回退它们可能撑爆配额,
+        # 或让文件卡在与 type 不符的目录里。回退内容, 不回退位置。
+        # parent_id 可以回退:它既不受配额管制,也不决定文件放哪个目录
+        restorable = (
+            "content", "name", "tags", "domain", "summary", "importance",
+            "valence", "arousal", "meaning", "why_remembered",
+            "event_time", "raw_source", "source_excerpt", "parent_id",
+        )
+        for key in restorable:
+            if key == "content":
+                continue
+            if key in old_meta:
+                post[key] = old_meta[key]
+            else:
+                try:
+                    if key in post:
+                        del post[key]
+                except Exception:
+                    pass
+        post.content = snap.get("content") or ""
+        post["last_active"] = now_iso()
+
+        try:
+            _atomic_write_text(file_path, frontmatter.dumps(post))
+        except OSError as e:
+            logger.error(f"rewind: 写回失败 {bucket_id}: {e}")
+            return False
+
+        self._invalidate_active_cache()
+        self._queue_embedding(bucket_id, post.content)
+        logger.info(f"Rewound bucket / 回退记忆: {bucket_id} → {snap.get('timestamp')}")
+        return True
+
+    # ---------------------------------------------------------
+    # 记忆树:parent_id 串起"这条是从哪条来的"
+    # 只是 frontmatter 里的一个字段,没有独立索引 —— 桶数量在千级以内
+    # 全量扫描完全够用,别为此建索引徒增一份要同步的状态。
+    # ---------------------------------------------------------
+    MAX_TREE_DEPTH = 12
+
+    def _parent_of(self, bucket_id: str) -> str:
+        file_path = self._find_bucket_file(str(bucket_id or "").strip())
+        if not file_path:
+            return ""
+        try:
+            return str(frontmatter.load(file_path).get("parent_id") or "").strip()
+        except Exception:
+            return ""
+
+    def _would_cycle(self, bucket_id: str, parent_id: str) -> bool:
+        """从候选父节点往上走,碰到自己就是成环;超过深度上限也判定为非法。"""
+        cur = str(parent_id or "").strip()
+        seen = set()
+        for _ in range(self.MAX_TREE_DEPTH):
+            if not cur:
+                return False           # 走到根,合法
+            if cur == bucket_id or cur in seen:
+                return True            # 碰到自己 / 已访问过 → 有环
+            seen.add(cur)
+            cur = self._parent_of(cur)
+        return True                    # 链太长,当非法处理,避免结构失控
+
+    async def ancestors(self, bucket_id: str) -> list[dict]:
+        """从直接父节点往上,一直到根。父节点缺失(被删/被归档)就停。"""
+        out = []
+        cur = self._parent_of(bucket_id)
+        seen = set()
+        while cur and cur not in seen and len(out) < self.MAX_TREE_DEPTH:
+            seen.add(cur)
+            node = await self.get(cur)
+            if not node:
+                break
+            out.append(node)
+            cur = str((node.get("metadata") or {}).get("parent_id") or "").strip()
+        return out
+
+    async def children(self, bucket_id: str, include_archive: bool = True) -> list[dict]:
+        bid = str(bucket_id or "").strip()
+        if not bid:
+            return []
+        all_b = await self.list_all(include_archive=include_archive)
+        return [b for b in all_b
+                if str((b.get("metadata") or {}).get("parent_id") or "").strip() == bid]
+
+    async def roots(self, include_archive: bool = False) -> list[dict]:
+        """没有父节点、但有子节点的桶 —— 即各条线的起点。"""
+        all_b = await self.list_all(include_archive=include_archive)
+        has_parent = {}
+        parented = set()
+        for b in all_b:
+            pid = str((b.get("metadata") or {}).get("parent_id") or "").strip()
+            has_parent[b["id"]] = pid
+            if pid:
+                parented.add(pid)
+        return [b for b in all_b if not has_parent.get(b["id"]) and b["id"] in parented]
+
+    async def subtree(self, bucket_id: str, depth: int = 3,
+                      include_archive: bool = True) -> dict:
+        """以 bucket_id 为根,往下展开 depth 层。返回嵌套 dict。"""
+        all_b = await self.list_all(include_archive=include_archive)
+        by_parent = {}
+        by_id = {}
+        for b in all_b:
+            by_id[b["id"]] = b
+            pid = str((b.get("metadata") or {}).get("parent_id") or "").strip()
+            if pid:
+                by_parent.setdefault(pid, []).append(b)
+
+        def build(bid, level, seen):
+            node = by_id.get(bid)
+            if not node or bid in seen:
+                return None
+            seen = seen | {bid}
+            meta = node.get("metadata") or {}
+            item = {
+                "id": bid,
+                "name": meta.get("name") or bid,
+                "type": meta.get("type", "dynamic"),
+                "preview": (node.get("content") or "").strip().replace("\n", " ")[:50],
+                "children": [],
+            }
+            if level < depth:
+                for child in by_parent.get(bid, []):
+                    built = build(child["id"], level + 1, seen)
+                    if built:
+                        item["children"].append(built)
+            return item
+
+        return build(str(bucket_id or "").strip(), 0, frozenset()) or {}
 
     # ---------------------------------------------------------
     # Purge: 真物理删除(回收站里点"永久删除")
