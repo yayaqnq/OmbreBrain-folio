@@ -58,6 +58,7 @@ from embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
 from media_store import MediaPersistenceError
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, atomic_update_config_yaml, coerce_bool, filesystem_turn, _win_long_path
+from typing import Optional, Literal
 from backup_utils import build_backup_payload
 from restore_utils import BackupRestoreError, apply_verified_restore, create_pre_restore_backup, inspect_backup_checkout, public_restore_report
 from oauth_manager import OAuthError, OAuthManager
@@ -98,6 +99,37 @@ bucket_mgr.attach_embedding_outbox(embedding_outbox)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 from families import FamilyManager
 family_mgr = FamilyManager(bucket_mgr.base_dir, embedding_engine, bucket_mgr, dehydrator)  # 记忆家族/归纳层
+
+# --- Desire engine (drive bar + thought pool) ---
+from desire_engine import (
+    CHORD_KEYS,
+    DRIVE_BASELINES,
+    DRIVE_KEYS,
+    DRIVE_EVENT_SCHEMA,
+    DesireEngine,
+    normalize_drive_key,
+    _normalize_chord,
+)
+
+DriveKeyName = Literal[
+    "attachment", "libido", "possessiveness", "reflection",
+    "stewardship", "curiosity", "social", "fatigue", "stress",
+]
+ChordName = Literal[
+    "C6", "Am7", "Gsus4", "Dmaj7", "Amaj7", "Fmaj7",
+    "Fmaj7#11", "Gmaj7", "Dm7", "Em7", "F#dim", "Bm7b5",
+]
+DriveActionName = Literal["stir", "settle", "break", "pass"]
+
+_desire_db = os.path.join(str(bucket_mgr.base_dir), "desire.db")
+_desire = DesireEngine(db_path=_desire_db)
+try:
+    _purged = _desire.purge_thoughts_by_source("dp_memory")
+    if _purged.get("removed"):
+        logger.info(f"purged legacy dp_memory thoughts: {_purged['removed']}")
+except Exception as _purge_exc:
+    logger.warning(f"purge dp_memory thoughts failed: {_purge_exc}")
+_last_signal_ts: list = [0.0]
 
 # --- /api/buckets in-memory cache / 内存级缓存 ---
 # 每个视图(cells/network/console/mobile)启动都自己拉一遍 /api/buckets,
@@ -2337,6 +2369,414 @@ async def dream() -> str:
 
 
 # =============================================================
+# Drive engine helpers + MCP tools
+# =============================================================
+
+def _num(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _sorted_thoughts(state: dict) -> list:
+    thoughts = state.get("thoughts") if isinstance(state.get("thoughts"), list) else []
+    return sorted(
+        [t for t in thoughts if isinstance(t, dict)],
+        key=lambda t: _num(t.get("born_at"), 0.0),
+        reverse=True,
+    )
+
+
+def _undertow_snapshot(state: dict) -> tuple:
+    drives = state.get("drives") if isinstance(state.get("drives"), dict) else {}
+    if not drives:
+        return "", 0.0, 0.0
+    candidates = {
+        key: _num(value) - _num(DRIVE_BASELINES.get(key))
+        for key, value in drives.items()
+        if key in DRIVE_BASELINES and key != "fatigue"
+    }
+    d = max(candidates, key=candidates.get, default="")
+    if not d:
+        return "", 0.0, 0.0
+    return d, round(candidates[d], 3), round(_num(drives.get(d)), 3)
+
+
+def _undercurrent_state(state: dict) -> dict:
+    state = state if isinstance(state, dict) else {}
+    weather = state.get("pulse_weather") if isinstance(state.get("pulse_weather"), dict) else {}
+    effective = state.get("effective_pa_na") if isinstance(state.get("effective_pa_na"), dict) else {}
+    source_weather = weather or effective
+    chemistry = source_weather.get("chord_chemistry") if isinstance(source_weather.get("chord_chemistry"), dict) else {}
+    core = source_weather.get("chemistry_core") or chemistry.get("core") or {}
+    route = source_weather.get("chemistry_route") or chemistry.get("route") or {}
+    thoughts = _sorted_thoughts(state)
+    drives = state.get("drives") if isinstance(state.get("drives"), dict) else {}
+    drive_order = [k for k in DRIVE_KEYS if k in drives] + [k for k in drives if k not in DRIVE_KEYS]
+    undertow_drive, undertow_pressure, undertow_raw = _undertow_snapshot(state)
+    if not undertow_drive:
+        undertow_drive = str(weather.get("undertow") or "").strip()
+        undertow_pressure = _num(weather.get("undertow_value"))
+        undertow_raw = _num(weather.get("undertow_raw_value"), _num(drives.get(undertow_drive)))
+    return {
+        "Drive": {k: round(_num(drives.get(k)), 3) for k in drive_order},
+        "Activation": {
+            k: round(_num((state.get("effective_activations") or {}).get(k)), 3)
+            for k in drive_order
+        },
+        "Undertow": {
+            "drive": undertow_drive,
+            "pressure": round(undertow_pressure, 3),
+            "raw": round(undertow_raw, 3),
+        },
+        "Affect": {
+            "Warmth": round(_num(source_weather.get("warmth"), _num(effective.get("effective_PA"), 0.0)), 3),
+            "Shadow": round(abs(_num(source_weather.get("shadow"), _num(effective.get("effective_NA"), 0.0))), 3),
+            "Longing": round(_num(source_weather.get("longing"), _num(state.get("longing"), 0.0)), 3),
+        },
+        "Chemistry": {
+            "Charge": round(_num(core.get("charge")), 3),
+            "Clutch": round(_num(core.get("clutch")), 3),
+            "Strain": round(_num(core.get("strain")), 3),
+            "Vector": route.get("vector") or "hover",
+        },
+        "Thought Pool": [
+            {
+                "index": i + 2,
+                "drive": t.get("drive"),
+                "kind": t.get("kind"),
+                "strength": t.get("strength"),
+                "text": str(t.get("text") or "").strip().replace("\n", " "),
+            }
+            for i, t in enumerate(thoughts[1:8])
+            if str(t.get("text") or "").strip()
+        ],
+    }
+
+
+SIGNAL_HINT_KEYS = {
+    "discernment": ("discernment", "doubt", "uncertain"),
+    "territorial": ("territorial", "boundary", "replacement alarm"),
+    "clutch": ("clutch", "anchor", "grip"),
+    "strain": ("strain", "tension", "pressure"),
+    "charge": ("charge", "impulse", "activation"),
+}
+SIGNAL_LEVEL_VALUES = {"low": 0.35, "mid": 0.62, "high": 0.86}
+
+
+def _normalize_signal_value(value, default: float = 0.0) -> float:
+    text = str(value or "").strip().lower()
+    if not text or text in {"none", "no", "false", "0"}:
+        return 0.0
+    if text in SIGNAL_LEVEL_VALUES:
+        return SIGNAL_LEVEL_VALUES[text]
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return default
+    if number <= 0:
+        return 0.0
+    return max(0.0, min(1.0, number))
+
+
+def _explicit_signal_hints(**values) -> dict:
+    hints = {}
+    for key in SIGNAL_HINT_KEYS:
+        value = _normalize_signal_value(values.get(key))
+        if value > 0:
+            hints[key] = round(value, 3)
+    return hints
+
+
+def _signal_hint_value(hints: dict, key: str) -> float:
+    return _normalize_signal_value((hints or {}).get(key))
+
+
+def _primary_drive_from_hints(hints: dict) -> str:
+    candidates = {
+        "discernment": "reflection",
+        "territorial": "possessiveness",
+        "clutch": "attachment",
+        "strain": "stress",
+        "charge": "curiosity",
+    }
+    best_key = ""
+    best_value = 0.0
+    for key in candidates:
+        value = _signal_hint_value(hints, key)
+        if value > best_value:
+            best_key = key
+            best_value = value
+    return candidates.get(best_key, "reflection")
+
+
+def _normalize_tool_chord(chord) -> str:
+    if chord is None:
+        return ""
+    text = str(chord or "").strip()
+    if not text:
+        return ""
+    if any(sep in text for sep in ("→", "->", " ", "，", ",")):
+        return ""
+    normalized = _normalize_chord(text)
+    if normalized in CHORD_KEYS:
+        return normalized
+    return ""
+
+
+def _pool_drive_thought(drive_key: str, thought: str, source: str) -> bool:
+    text = (thought or "").strip()
+    if not text:
+        return False
+    _desire.add_thought(text, drive_key, strength=0.5, source=source)
+    return True
+
+
+def _apply_drive_action_weather(
+    action: str,
+    drive_key: str,
+    thought: str = "",
+    chord: str = "",
+    signal_hints: dict | None = None,
+) -> dict:
+    meta: dict = {}
+    chord = _normalize_tool_chord(chord)
+    signal_hints = signal_hints or {}
+    gesture = normalize_drive_key(drive_key) or str(drive_key or "").strip()
+
+    if chord:
+        try:
+            echo = _desire.apply_chord_echo(chord, source="thought")
+            meta["chord_echo"] = True
+            active = (echo or {}).get("active_chord") or chord
+            if active:
+                meta["active_chord"] = active
+        except Exception as e:
+            logger.warning(f"drive {action} chord echo failed: {e}")
+
+    if not signal_hints:
+        return meta
+
+    discernment = _signal_hint_value(signal_hints, "discernment")
+    territorial = _signal_hint_value(signal_hints, "territorial")
+    clutch = _signal_hint_value(signal_hints, "clutch")
+    strain = _signal_hint_value(signal_hints, "strain")
+    charge = _signal_hint_value(signal_hints, "charge")
+    peak = max(discernment, territorial, clutch, strain, charge)
+    if peak <= 0:
+        return meta
+
+    brain = {
+        "source": "manual",
+        "target": "self",
+        "grounding": "实",
+        "anchor_target": "drive_thought",
+        "drive_action": action,
+        "gesture_drive": gesture,
+    }
+    if discernment:
+        brain["discernment_alarm"] = discernment
+    if territorial:
+        brain["territorial_alarm"] = territorial
+        brain["territorial_event"] = "drive_boundary"
+        brain["anchor_target"] = "boundary"
+    if clutch:
+        brain["closeness_pull"] = clutch
+    if strain:
+        brain["tension_load"] = strain
+        brain["inward_pull"] = max(float(brain.get("inward_pull", 0.0) or 0.0), strain * 0.65)
+    if charge:
+        brain["novelty_pull"] = max(float(brain.get("novelty_pull", 0.0) or 0.0), charge)
+        brain["expression_pressure"] = max(
+            float(brain.get("expression_pressure", 0.0) or 0.0), charge * 0.7
+        )
+
+    primary_drive = _primary_drive_from_hints(signal_hints)
+    same_as_gesture = bool(primary_drive and primary_drive == gesture)
+    if same_as_gesture:
+        ranked = sorted(
+            (
+                ("discernment", discernment, "reflection"),
+                ("territorial", territorial, "possessiveness"),
+                ("clutch", clutch, "attachment"),
+                ("strain", strain, "stress"),
+                ("charge", charge, "curiosity"),
+            ),
+            key=lambda row: row[1],
+            reverse=True,
+        )
+        for _name, value, mapped in ranked:
+            if value > 0 and mapped != gesture:
+                primary_drive = mapped
+                same_as_gesture = False
+                break
+
+    intensity = peak
+    if action == "stir":
+        intensity *= 0.55
+    elif action in {"settle", "break", "pass"}:
+        intensity *= 0.45
+    if same_as_gesture:
+        intensity *= 0.30
+
+    try:
+        event = {
+            "schema_version": DRIVE_EVENT_SCHEMA,
+            "source": "manual",
+            "primary_drive": primary_drive or None,
+            "secondary_drives": {},
+            "intensity": intensity,
+            "confidence": 0.78,
+            "agency": 0.80,
+            "event_label": f"drive_{action}_signal",
+            "brain": brain,
+            "evidence": [str(thought or "").strip()[:180]] if str(thought or "").strip() else [f"{action}:{gesture}"],
+        }
+        applied = _desire.apply_drive_event(event)
+        meta["signal_weather"] = True
+        if isinstance(applied, dict) and applied.get("primary_drive"):
+            meta["signal_primary"] = applied.get("primary_drive")
+    except Exception as e:
+        logger.warning(f"drive {action} signal weather failed: {e}")
+    return meta
+
+
+def _merge_drive_result(result, *, pooled: bool = False, weather_meta: dict | None = None,
+                        pulse_engaged: dict | None = None) -> dict:
+    if not isinstance(result, dict):
+        result = {"result": result}
+    if pooled:
+        result["thought_pooled"] = True
+    if weather_meta:
+        if weather_meta.get("chord_echo"):
+            result["chord_echo"] = True
+            if weather_meta.get("active_chord"):
+                result["active_chord"] = weather_meta["active_chord"]
+        if weather_meta.get("signal_weather"):
+            result["signal_weather"] = True
+            if weather_meta.get("signal_primary"):
+                result["signal_primary"] = weather_meta["signal_primary"]
+    if pulse_engaged:
+        result["pulse_engaged"] = pulse_engaged
+    return result
+
+
+def _maybe_engage_pulse(via: str, drive_key: str = "") -> dict | None:
+    try:
+        return _desire.engage_pulse_pending(via=via, drive_key=drive_key)
+    except Exception as e:
+        logger.warning(f"engage_pulse_pending failed: {e}")
+        return None
+
+
+def _stir(drive_key, delta=0.18, thought="", chord=None,
+          discernment="", territorial="", clutch="", strain="", charge=""):
+    signal_hints = _explicit_signal_hints(
+        discernment=discernment, territorial=territorial,
+        clutch=clutch, strain=strain, charge=charge,
+    )
+    if str(drive_key or "").strip().lower() == "attachment" and thought.strip():
+        delta *= 0.30
+    result = _desire.pulse(drive_key, delta, chord="")
+    pooled = _pool_drive_thought(drive_key, thought, source="stir")
+    weather_meta = _apply_drive_action_weather(
+        "stir", drive_key, thought=thought, chord=chord, signal_hints=signal_hints
+    )
+    engaged = _maybe_engage_pulse("stir", drive_key)
+    return _merge_drive_result(result, pooled=pooled, weather_meta=weather_meta, pulse_engaged=engaged)
+
+
+def _settle(drive_key, thought="", chord=None,
+            discernment="", territorial="", clutch="", strain="", charge=""):
+    signal_hints = _explicit_signal_hints(
+        discernment=discernment, territorial=territorial,
+        clutch=clutch, strain=strain, charge=charge,
+    )
+    result = _desire.satisfy(drive_key)
+    pooled = _pool_drive_thought(drive_key, thought, source="settle")
+    weather_meta = _apply_drive_action_weather(
+        "settle", drive_key, thought=thought, chord=chord, signal_hints=signal_hints
+    )
+    engaged = _maybe_engage_pulse("settle", drive_key)
+    return _merge_drive_result(result, pooled=pooled, weather_meta=weather_meta, pulse_engaged=engaged)
+
+
+def _break_drive(drive_key, thought="", chord=None,
+                 discernment="", territorial="", clutch="", strain="", charge=""):
+    text = (thought or "").strip()
+    signal_hints = _explicit_signal_hints(
+        discernment=discernment, territorial=territorial,
+        clutch=clutch, strain=strain, charge=charge,
+    )
+    result = _desire.refuse(drive_key, reason=text or None)
+    pooled = _pool_drive_thought(drive_key, text, source="break")
+    weather_meta = _apply_drive_action_weather(
+        "break", drive_key, thought=text, chord=chord, signal_hints=signal_hints
+    )
+    engaged = _maybe_engage_pulse("break", drive_key)
+    return _merge_drive_result(result, pooled=pooled, weather_meta=weather_meta, pulse_engaged=engaged)
+
+
+def _pass_drive(drive_key, thought="", chord=None,
+                discernment="", territorial="", clutch="", strain="", charge=""):
+    text = (thought or "").strip()
+    signal_hints = _explicit_signal_hints(
+        discernment=discernment, territorial=territorial,
+        clutch=clutch, strain=strain, charge=charge,
+    )
+    result = _desire.pass_intent(drive_key, reason=text or None)
+    pooled = _pool_drive_thought(drive_key, text, source="pass")
+    weather_meta = _apply_drive_action_weather(
+        "pass", drive_key, thought=text, chord=chord, signal_hints=signal_hints
+    )
+    engaged = _maybe_engage_pulse("pass", drive_key)
+    return _merge_drive_result(result, pooled=pooled, weather_meta=weather_meta, pulse_engaged=engaged)
+
+
+@mcp.tool(name="undercurrent")
+def undercurrent_tool() -> dict:
+    """weather当前状态与详细展开层。"""
+    _desire.tick(idle_seconds=0)
+    return _undercurrent_state(_desire.state())
+
+
+@mcp.tool(name="drive")
+def drive_tool(
+    action: DriveActionName,
+    drive_key: DriveKeyName,
+    delta: float = 0.18,
+    thought: str = "",
+    chord: Optional[ChordName] = None,
+    discernment: str = "",
+    territorial: str = "",
+    clutch: str = "",
+    strain: str = "",
+    charge: str = "",
+) -> dict:
+    """调Drive。action=stir/settle/break/pass。
+    drive_key：九维之一 attachment/libido/possessiveness/reflection/stewardship/curiosity/social/fatigue/stress。
+    thought：念头主通道，有字自动进池。
+    chord：可选和弦枚举（C6/Am7/Gsus4/Dmaj7/Amaj7/Fmaj7/Fmaj7#11/Gmaj7/Dm7/Em7/F#dim/Bm7b5）。
+    discernment/territorial/clutch/strain/charge：可选手感 0-1。
+    stir 还可带 delta。"""
+    action = (action or "").strip().lower()
+    signal_kwargs = dict(
+        chord=chord, discernment=discernment, territorial=territorial,
+        clutch=clutch, strain=strain, charge=charge,
+    )
+    if action == "stir":
+        return _stir(drive_key, delta=delta, thought=thought, **signal_kwargs)
+    if action == "settle":
+        return _settle(drive_key, thought=thought, **signal_kwargs)
+    if action == "break":
+        return _break_drive(drive_key, thought=thought, **signal_kwargs)
+    if action == "pass":
+        return _pass_drive(drive_key, thought=thought, **signal_kwargs)
+    return {"ok": False, "error": "action must be stir/settle/break/pass"}
+
+
+# =============================================================
 # Runtime config endpoints — 前端 config 页面切 API 用
 # 持久化:{buckets_dir}/runtime_config.json
 # 加载链:runtime_config.json > env vars > config.yaml > 默认
@@ -4202,6 +4642,76 @@ async def api_bucket_snapshot_restore(request):
     })
 
 
+# --- Drive engine HTTP endpoints (dashboard) ---
+
+@mcp.custom_route("/api/drive/state", methods=["GET"])
+async def api_drive_state(request):
+    """只读：当前drive/intent/pa_na等快照，不tick。"""
+    from starlette.responses import JSONResponse
+    state = _desire.state()
+    try:
+        thoughts = sorted(
+            state.get("thoughts", []),
+            key=lambda t: float(t.get("born_at", 0) or 0),
+            reverse=True,
+        )
+        state["thoughts"] = thoughts
+        weather = _desire.weather_state()
+        warmth = float(weather.get("effective_PA", state.get("pa_na", {}).get("PA", 0.5)))
+        shadow = float(weather.get("effective_NA", state.get("pa_na", {}).get("NA", 0.2)))
+        top_drive, _, undertow_raw_value = _undertow_snapshot(state)
+        _activations = state.get("effective_activations") or state.get("drive_activations") or {}
+        undertow_value = _num(
+            _activations.get(top_drive) if isinstance(_activations, dict) else None,
+            undertow_raw_value,
+        )
+        state["pulse_weather"] = {
+            "undertow": top_drive,
+            "undertow_value": round(undertow_value, 3),
+            "undertow_raw_value": round(undertow_raw_value, 3),
+            "warmth": round(warmth, 3),
+            "shadow": round(shadow, 3),
+            "current_chord": weather.get("current_chord", ""),
+            "active_chord": weather.get("active_chord", ""),
+        }
+    except Exception:
+        pass
+    return JSONResponse(state)
+
+
+@mcp.custom_route("/api/drive/events", methods=["GET"])
+async def api_drive_events(request):
+    """最近的 drive 事件记录。"""
+    from starlette.responses import JSONResponse
+    try:
+        limit = int(request.query_params.get("limit", "20"))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(100, limit))
+    events = _desire.store.recent_drive_events(limit=limit)
+    return JSONResponse({"events": events})
+
+
+@mcp.custom_route("/api/drive/action", methods=["POST"])
+async def api_drive_action(request):
+    """从面板触发 drive 动作。"""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+    action = str(body.get("action", "")).strip().lower()
+    drive_key = str(body.get("drive_key", "")).strip()
+    delta = float(body.get("delta", 0.18) or 0.18)
+    thought = str(body.get("thought", "")).strip()
+    if action not in ("stir", "settle", "break", "pass"):
+        return JSONResponse({"error": "action must be stir/settle/break/pass"}, status_code=400)
+    if not normalize_drive_key(drive_key):
+        return JSONResponse({"error": "invalid drive_key"}, status_code=400)
+    result = drive_tool(action=action, drive_key=drive_key, delta=delta, thought=thought)
+    return JSONResponse(result)
+
+
 @mcp.custom_route("/api/bucket/{bucket_id}/purge", methods=["POST"])
 async def api_bucket_purge(request):
     """永久删除:物理删文件 + 清 embedding。不可撤销。
@@ -5402,7 +5912,7 @@ def _serve_v2(rel_path: str, request=None):
         # 跨平台: Windows 上 abs_path 可能混用 \ 和 / (os.path.join + norm 里的 /),
         # 先统一成 / 再两头 strip, 否则 tail 会带前导 / 导致匹配失败 (本地 Windows 404)。
         tail = abs_path[len(console_base):].replace("\\", "/").strip("/")
-        if tail in ("breath", "config", "import", "trash", "safety", "commitments", "operations"):
+        if tail in ("breath", "config", "import", "trash", "safety", "commitments", "operations", "drive"):
             if not rel_path.endswith("/"):
                 return RedirectResponse(url="/v2/console/" + tail + "/", status_code=301)
             abs_path = os.path.join(console_base, "index.html")
@@ -5892,6 +6402,42 @@ if __name__ == "__main__":
 
         t = threading.Thread(target=_start_keepalive, daemon=True)
         t.start()
+
+        # --- Desire engine heartbeat (900s tick) ---
+        async def _desire_heartbeat_loop():
+            await asyncio.sleep(60)
+            try:
+                from desire_engine import DESIRE_TICK_SECONDS as _tick_sec
+            except Exception:
+                _tick_sec = 900
+            tick_sec = float(_tick_sec or 900)
+
+            while True:
+                try:
+                    now = time.time()
+                    has_signal = (now - _last_signal_ts[0]) < tick_sec
+                    _desire.tick(idle_seconds=tick_sec, has_signal=has_signal)
+
+                    try:
+                        rhythm = _desire.rhythm_state()
+                        logger.info(f"Rhythm: {rhythm['label']} (val={rhythm['value']})")
+                        grief = _desire.grief_state()
+                        if grief["layer"] != "none":
+                            logger.info(f"Grief layer: {grief['layer']} (protest_ticks={grief['protest_ticks']})")
+                    except Exception as e:
+                        logger.warning(f"Rhythm/grief state log failed: {e}")
+
+                    logger.info("Desire heartbeat tick")
+                except Exception as e:
+                    logger.warning(f"Desire heartbeat failed: {e}")
+                await asyncio.sleep(tick_sec)
+
+        def _start_desire_heartbeat():
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_desire_heartbeat_loop())
+
+        hb = threading.Thread(target=_start_desire_heartbeat, daemon=True)
+        hb.start()
 
         # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
         # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---
