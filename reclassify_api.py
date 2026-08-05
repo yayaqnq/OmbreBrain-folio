@@ -52,7 +52,7 @@ def sanitize(name):
 async def reclassify():
     client = AsyncOpenAI(
         api_key=os.environ.get("OMBRE_API_KEY", ""),
-        base_url="https://api.siliconflow.cn/v1",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         timeout=60.0,
     )
 
@@ -68,7 +68,7 @@ async def reclassify():
 
         try:
             resp = await client.chat.completions.create(
-                model="deepseek-ai/DeepSeek-V3",
+                model="gemini-2.5-flash",
                 messages=[
                     {"role": "system", "content": ANALYZE_PROMPT},
                     {"role": "user", "content": full_text[:2000]},
